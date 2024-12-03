@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+import math
 
 from pytorchtools import EarlyStopping
 import torch
@@ -15,16 +16,16 @@ from torch.nn import functional as F
 from matplotlib import pyplot as plt
 from GLI_CAM import GLIBlock
 import shutil
-import time 
+import time
 from matplotlib import pyplot as plt
 from prettytable import PrettyTable
 from torch.optim import *
 from torchvision.transforms import *
 from utils.mydata_xu import *
 from ST_GCN.ST_GCN_Block import ST_GCN_18
-from Swin_TF.swin_transformer import SwinTransformer3D,SwinTransformerBlock3D
-from Fusionlist.AFF_fusion import AFF 
-from CMT import cmt_s
+# from Swin_TF.swin_transformer import SwinTransformer3D,SwinTransformerBlock3D
+from Fusion import AFF as RDF
+# from CMT import cmt_s
 # 设置 max_split_size_mb 为256MB
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
 
@@ -545,46 +546,36 @@ class AxialAttentionNet(nn.Module):
         return self._forward_impl(x)
 
 
-def axial26s(pretrained=False, **kwargs):
+def PMANet_S(pretrained=False, **kwargs):
     model = AxialAttentionNet(AxialBlock, [1, 2, 4, 1], s=0.5, **kwargs)
     return model
 
 
-def axial50s(pretrained=False, **kwargs):
+def PMANet_M(pretrained=False, **kwargs):
     model = AxialAttentionNet(AxialBlock, [3, 4, 6, 3], s=0.5, **kwargs)
     return model
 
 
-def axial50m(pretrained=False, **kwargs):
+def PMANet_L(pretrained=False, **kwargs):
     model = AxialAttentionNet(AxialBlock, [3, 4, 6, 3], s=0.75, **kwargs)
     return model
 
 
-def axial50l(pretrained=False, **kwargs):
+def PMANet_XL(pretrained=False, **kwargs):
     model = AxialAttentionNet(AxialBlock, [3, 4, 6, 3], s=1, **kwargs)
     return model
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+        
     
 class TotalNet(nn.Module):
     def __init__(self):
         super(TotalNet, self).__init__()
-        self.vgg1 = axial26s(pretrained=False)
-        self.vgg2 = axial26s(pretrained=False)
-        self.vgg3 = axial26s(pretrained=False)
-        self.vgg4 = axial26s(pretrained=False)
+        self.subnet1 = PMANet_S(pretrained=False)
+        self.subnet2 = PMANet_S(pretrained=False)
+        self.subnet3 = PMANet_S(pretrained=False)
+        self.subnet4 = PMANet_S(pretrained=False)
         
-        self.vgg5 = ImageConvNet_face() #ImageConvNet()
-        self.vgg6 = ImageConvNet_body()# ResNet(Bottleneck,[3,4,6,3],4)
+        self.subnet5 = ImageConvNet_face() #ImageConvNet()
+        self.subnet6 = ImageConvNet_body()# ResNet(Bottleneck,[3,4,6,3],4)
 
 #         self.st_gcn1 = ST_GCN_18()
 #         self.st_gcn2 = ST_GCN_18()
@@ -594,24 +585,28 @@ class TotalNet(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         combined_features = 512
         
-        self.aff_module_for_people_scenes = AFF(channels=512)
-        self.aff_module_for_fused_points = AFF(channels=512)
-       
-        self.fc1 = nn.Linear(combined_features, 5) #512
-        self.fc2 = nn.Linear(combined_features, 7)
-        self.fc3 = nn.Linear(combined_features, 3)
-        self.fc4 = nn.Linear(combined_features, 5)
+        self.aff_module_for_people_scenes = RDF(channels=512)
+        self.aff_module_for_fused_points = RDF(channels=512)
+        
+        self.fc_split = nn.Linear(combined_features, 256)  # 4 * 64 = 256
+        self.fc_fused = nn.Linear(combined_features, 256)  # 4 * 64 = 256
+
+        
+        self.fc1 = nn.Linear(256, 5) #512
+        self.fc2 = nn.Linear(256, 7)
+        self.fc3 = nn.Linear(256, 3)
+        self.fc4 = nn.Linear(256, 5)
 
     def forward(self, img1,img2,img3,img4,face,body,gesture,posture):
 
         # print('image shape:', img1.shape)
-        h1 = self.vgg1(img1)
-        h2 = self.vgg2(img2)
-        h3 = self.vgg3(img3)
-        h4 = self.vgg4(img4)
+        h1 = self.subnet1(img1)
+        h2 = self.subnet2(img2)
+        h3 = self.subnet3(img3)
+        h4 = self.subnet4(img4)
         
-        h_face = self.vgg5(face)
-        h_body = self.vgg6(body)
+        h_face = self.subnet5(face)
+        h_body = self.subnet6(body)
         
         # h_gesture = self.st_gcn1(gesture)
         # h_posture = self.st_gcn2(posture)
@@ -678,18 +673,29 @@ class TotalNet(nn.Module):
         # print('x_fused_final shape:', x_fused_final.shape)
         
         x_fused_final = self.avg_pool(x_fused_final).view(x_fused_final.size(0), -1)
-        # 应用全连接层以融合特征并预测输出
-        out1 = self.fc1(x_fused_final)
-        out2 = self.fc2(x_fused_final)
-        out3 = self.fc3(x_fused_final)
-        out4 = self.fc4(x_fused_final)
         
-        # print('out1 shape:', out1.shape)
-        # print('out2 shape:', out2.shape)
-        # print('out3 shape:', out3.shape)
-        # print('out4 shape:', out4.shape)
+        
+        # 使用新的全连接层将 x_fused_final 分成四个 64 维度的特征向量
+        x_fused_split = self.fc_fused(x_fused_final).view(-1, 4, 64)
+        x_fused_out1 = x_fused_split[:, 0, :]
+        x_fused_out2 = x_fused_split[:, 1, :]
+        x_fused_out3 = x_fused_split[:, 2, :]
+        x_fused_out4 = x_fused_split[:, 3, :]
+
+        # 拼接特征向量
+        out1_features = torch.cat((x_fused_out1, x_fused_out2, x_fused_out3, x_fused_out4), dim=1)
+        out2_features = torch.cat((x_fused_out2, x_fused_out1, x_fused_out3, x_fused_out4), dim=1)
+        out3_features = torch.cat((x_fused_out3, x_fused_out1, x_fused_out2, x_fused_out4), dim=1)
+        out4_features = torch.cat((x_fused_out4, x_fused_out1, x_fused_out2, x_fused_out3), dim=1)
+
+        # 通过原有的全连接层计算输出
+        out1 = self.fc1(out1_features)
+        out2 = self.fc2(out2_features)
+        out3 = self.fc3(out3_features)
+        out4 = self.fc4(out4_features)
 
         return out1, out2, out3, out4
+        
 
 
 # VGG16
@@ -1035,7 +1041,7 @@ choices = ["demo", "main", "test", "checkValidation", "getVideoEmbeddings", "gen
 # parser = argparse.ArgumentParser(description="Select code to run.")
 # parser.add_argument('--mode', default="test", choices=choices, type=str)
 
-checkpoint_dir = '/root/GLMDrivenet'
+checkpoint_dir = '/root/AIDE'
 
 
 class valConfusionMatrix(object):
@@ -1162,13 +1168,12 @@ class AccAverageMeter(object):
 
 
 # Main function here
-def main(use_cuda=True, EPOCHS=100, batch_size=48):
+def main(use_cuda=True, EPOCHS=125, batch_size=48):
     # model = ImageConvNet().cuda()
     # model = TotalNet().cuda()
     model = TotalNet()  # 创建模型实例
     model = nn.DataParallel(model)  # 使用 DataParallel 包装模型
     
-    # model_dict = torch.load("/root/GLMDrivenet/best_model_cmt.pt")
     # # model.load_state_dict({k.replace('module.',''):v for k,v in model_dict.items()})
     # model.load_state_dict(model_dict, strict=False)
     
@@ -1206,8 +1211,6 @@ def main(use_cuda=True, EPOCHS=100, batch_size=48):
     best_avgf1 = 0
     best_weightf1 = 0
 
-    # with open("result_body_res.txt", "w") as f:
-    #     pass
 
     for epoch in range(EPOCHS):
         if ( epoch <= 25):
@@ -1333,7 +1336,7 @@ def main(use_cuda=True, EPOCHS=100, batch_size=48):
                 train_acc3.getacc(),
                 train_acc4.getacc()))
 
-            with open(file="/root/GLMDrivenet/CNNTrans_aff.txt", mode="a+") as f:
+            with open(file="/root/AIDE/CNNTrans_aff2.txt", mode="a+") as f:
                 f.write("Epoch: %d, Subepoch: %d, Loss: %f, batch_size: %d, total_acc1: %f,total_acc2: %f, total_acc3: %f, total_acc4: %f"\
                      %(epoch, subepoch, train_losses.avg, M, train_acc1.getacc(), train_acc2.getacc(), train_acc3.getacc(), train_acc4.getacc()))
 
@@ -1479,7 +1482,7 @@ def main(use_cuda=True, EPOCHS=100, batch_size=48):
                         val_acc3.getacc(),
                         val_acc4.getacc(), avgf11, avgf12, avgf13, avgf14))
                 
-                with open(file="/root/GLMDrivenet/val_CNNTrans_aff.txt", mode="a+") as f:
+                with open(file="/root/AIDE/val_CNNTrans_aff2.txt", mode="a+") as f:
                     f.write("Epoch: %d, Subepoch: %d, Loss: %f, batch_size: %d, total_acc1: %f,total_acc2: %f, total_acc3: %f, total_acc4: %f, \
                             avgf11: %f, avgf12: %f, avgf13: %f, avgf14: %f\n"\
                      %(epoch, subepoch1, val_losses, M, val_acc1.getacc(), val_acc2.getacc(), val_acc3.getacc(), val_acc4.getacc(),avgf11, avgf12, avgf13, avgf14))
@@ -1500,9 +1503,9 @@ def main(use_cuda=True, EPOCHS=100, batch_size=48):
 
 
         # 保存最佳模型(将当前模型的权重保存到best_model.pt文件中)
-        best_path = os.path.join(checkpoint_dir, 'best_model_CNNTrans_aff_out1.pt')
+        best_path = os.path.join(checkpoint_dir, 'best_model_CNNTrans_aff_out2.pt')
         if is_best:
-            with open(file="/root/val_CNNTrans_aff.txt", mode="w") as f:
+            with open(file="/root/val_CNNTrans_aff2.txt", mode="w") as f:
                     f.write("Epoch: %d, Subepoch: %d, Loss: %f, batch_size: %d, total_acc1: %f,total_acc2: %f, total_acc3: %f, total_acc4: %f, \
                             avgf11: %f, avgf12: %f, avgf13: %f, avgf14: %f\n"\
                      %(epoch, subepoch1, val_losses, M, val_acc1.getacc(), val_acc2.getacc(), val_acc3.getacc(), val_acc4.getacc(),avgf11, avgf12, avgf13, avgf14))
@@ -1545,7 +1548,7 @@ class TestMeter(object):
         return (self.sum * 100) / self.count
 
 
-def test(use_cuda=True, batch_size=16, model_name="/root/GLMDrivenet/best_model_CNNTrans_aff_out1.pt"):
+def test(use_cuda=True, batch_size=16, model_name="/root/AIDE/best_model_CNNTrans_aff_out2.pt"):
 
     model = TotalNet()  # 创建模型实例
     model = nn.DataParallel(model)  # 使用 DataParallel 包装模型
@@ -1672,7 +1675,7 @@ def test(use_cuda=True, batch_size=16, model_name="/root/GLMDrivenet/best_model_
                     test_acc3.getacc(),
                     test_acc4.getacc(), avgf11, avgf12, avgf13, avgf14))
             
-            with open(file="/root/GLMDrivenet/test_CNNTrans_aff_axialnet.txt", mode="a+") as f:
+            with open(file="/root/AIDE/test_CNNTrans_aff_axialnet2.txt", mode="a+") as f:
                     f.write("Test  Subepoch: %d, batch_size: %d,total_acc1: %f, total_acc2: %f, "
                 "total_acc3: %f, total_acc4: %f, avgf11: %f, avgf12: %f, avgf13: %f, avgf14: %f\n"\
                      %(subepoch2, M,
@@ -1696,7 +1699,7 @@ def test(use_cuda=True, batch_size=16, model_name="/root/GLMDrivenet/best_model_
 if __name__ == "__main__":
     cuda = True
 
-mode = "train"
+mode = "test"
 print("running...")
 
 if mode == "train":
